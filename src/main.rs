@@ -10,6 +10,7 @@ use warp::Reply;
 use std::convert::Infallible;
 use std::env;
 use dotenv::dotenv;
+use std::time::Duration;
 
 // Define a type alias for our user storage
 type Users = Arc<RwLock<HashMap<String, mpsc::UnboundedSender<Result<Message, warp::Error>>>>>;
@@ -45,7 +46,8 @@ async fn main() {
 
     // Initialize our user storage
     let users = Users::default();
-    let users = warp::any().map(move || users.clone());
+    let users_for_cleanup = users.clone(); // Clone here to use in the cleanup task
+    let users_filter = warp::any().map(move || users.clone());
 
     // Initialize global video state
     let global_video_state = GlobalVideoState::default();
@@ -65,14 +67,14 @@ async fn main() {
     let connect = warp::post()
         .and(warp::path("connect"))
         .and(warp::body::json())
-        .and(users.clone())
+        .and(users_filter.clone())
         .and(warp::any().map(move || correct_password.clone()))
         .and_then(handle_connect);
 
     // Define the WebSocket route
     let ws_route = warp::path("ws")
         .and(warp::ws())
-        .and(users)
+        .and(users_filter.clone())
         .and(global_video_state)
         .map(|ws: warp::ws::Ws, users, state| {
             ws.on_upgrade(move |socket| user_connected(socket, users, state))
@@ -80,6 +82,14 @@ async fn main() {
 
     // Combine routes and apply CORS
     let routes = connect.or(ws_route).with(cors);
+
+    // Start the cleanup task
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            cleanup_disconnected_users(&users_for_cleanup).await;
+        }
+    });
 
     // Start the server
     println!("Starting server on 127.0.0.1:3030");
@@ -92,7 +102,7 @@ async fn handle_connect(request: ConnectRequest, users: Users, correct_password:
         return Ok(warp::reply::with_status("Incorrect password", warp::http::StatusCode::UNAUTHORIZED));
     }
     
-    let users_count = users.read().await.len();
+    let users_count = users.read().await.iter().filter(|(_, tx)| !tx.is_closed()).count();
     if users_count >= MAX_USERS {
         return Ok(warp::reply::with_status("Room is full", warp::http::StatusCode::FORBIDDEN));
     }
@@ -100,13 +110,10 @@ async fn handle_connect(request: ConnectRequest, users: Users, correct_password:
     Ok(warp::reply::with_status("Connected", warp::http::StatusCode::OK))
 }
 
-// Handle new WebSocket connection
 async fn user_connected(ws: WebSocket, users: Users, state: GlobalVideoState) {
-    // Split the socket into a sender and receive of messages.
     let (user_ws_tx, mut user_ws_rx) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
 
-    // Use tokio spawn to handle the send stream
     tokio::task::spawn(UnboundedReceiverStream::new(rx)
         .forward(user_ws_tx)
         .map(|result| {
@@ -116,18 +123,15 @@ async fn user_connected(ws: WebSocket, users: Users, state: GlobalVideoState) {
         })
     );
 
-    // Generate a user ID and add the user to our map
     let user_id = generate_user_id();
     users.write().await.insert(user_id.clone(), tx.clone());
 
     println!("New user connected: {}", user_id);
 
-    // Send current video state to the new user
     if let Some(current_state) = state.read().await.clone() {
         let _ = tx.send(Ok(Message::text(serde_json::to_string(&current_state).unwrap())));
     }
 
-    // Handle incoming messages
     while let Some(result) = user_ws_rx.next().await {
         let msg = match result {
             Ok(msg) => msg,
@@ -139,20 +143,16 @@ async fn user_connected(ws: WebSocket, users: Users, state: GlobalVideoState) {
         user_message(user_id.clone(), msg, &users, &state).await;
     }
 
-    // User disconnected
     user_disconnected(user_id, &users).await;
 }
 
-// Handle a message from a user
 async fn user_message(user_id: String, msg: Message, users: &Users, state: &GlobalVideoState) {
-    // Try to get the message as a string
     let msg = if let Ok(s) = msg.to_str() {
         s
     } else {
         return;
     };
 
-    // Parse the message as VideoState
     let video_state: VideoState = match serde_json::from_str(msg) {
         Ok(state) => state,
         Err(e) => {
@@ -163,13 +163,10 @@ async fn user_message(user_id: String, msg: Message, users: &Users, state: &Glob
 
     println!("Received message from {}: {:?}", user_id, video_state);
 
-    // Update global video state
     *state.write().await = Some(video_state.clone());
 
-    // Prepare the message to send
     let new_msg = serde_json::to_string(&video_state).unwrap();
 
-    // Send the message to all other users
     for (uid, tx) in users.read().await.iter() {
         if *uid != user_id {
             if let Err(_disconnected) = tx.send(Ok(Message::text(new_msg.clone()))) {
@@ -181,13 +178,19 @@ async fn user_message(user_id: String, msg: Message, users: &Users, state: &Glob
     }
 }
 
-// Handle a user disconnection
 async fn user_disconnected(user_id: String, users: &Users) {
-    users.write().await.remove(&user_id);
+    let mut users = users.write().await;
+    if let Some(tx) = users.remove(&user_id) {
+        drop(tx); // Ensure the channel is closed
+    }
     println!("User disconnected: {}", user_id);
 }
 
-// Generate a random user ID
+async fn cleanup_disconnected_users(users: &Users) {
+    let mut users = users.write().await;
+    users.retain(|_, tx| !tx.is_closed());
+}
+
 fn generate_user_id() -> String {
     use rand::Rng;
     rand::thread_rng()
