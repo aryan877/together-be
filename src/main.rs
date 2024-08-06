@@ -46,12 +46,12 @@ async fn main() {
 
     // Initialize our user storage
     let users = Users::default();
-    let users_for_cleanup = users.clone(); // Clone here to use in the cleanup task
+    let users_for_cleanup = users.clone();
     let users_filter = warp::any().map(move || users.clone());
 
     // Initialize global video state
     let global_video_state = GlobalVideoState::default();
-    let global_video_state = warp::any().map(move || global_video_state.clone());
+    let global_video_state_filter = warp::any().map(move || global_video_state.clone());
 
     // Get the allowed origin from environment variable or use default
     let allowed_origin = env::var("ALLOWED_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".to_string());
@@ -74,8 +74,8 @@ async fn main() {
     // Define the WebSocket route
     let ws_route = warp::path("ws")
         .and(warp::ws())
-        .and(users_filter.clone())
-        .and(global_video_state)
+        .and(users_filter)
+        .and(global_video_state_filter)
         .map(|ws: warp::ws::Ws, users, state| {
             ws.on_upgrade(move |socket| user_connected(socket, users, state))
         });
@@ -92,9 +92,9 @@ async fn main() {
     });
 
     // Start the server
-    println!("Starting server on 127.0.0.1:3030");
+    println!("Starting server on 0.0.0.0:3030");
     println!("Allowed origin: {}", allowed_origin);
-    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 }
 
 async fn handle_connect(request: ConnectRequest, users: Users, correct_password: String) -> Result<impl Reply, Infallible> {
@@ -128,6 +128,7 @@ async fn user_connected(ws: WebSocket, users: Users, state: GlobalVideoState) {
 
     println!("New user connected: {}", user_id);
 
+    // Send current state to the new user
     if let Some(current_state) = state.read().await.clone() {
         let _ = tx.send(Ok(Message::text(serde_json::to_string(&current_state).unwrap())));
     }
@@ -143,7 +144,7 @@ async fn user_connected(ws: WebSocket, users: Users, state: GlobalVideoState) {
         user_message(user_id.clone(), msg, &users, &state).await;
     }
 
-    user_disconnected(user_id, &users).await;
+    user_disconnected(user_id, &users, &state).await;
 }
 
 async fn user_message(user_id: String, msg: Message, users: &Users, state: &GlobalVideoState) {
@@ -163,7 +164,32 @@ async fn user_message(user_id: String, msg: Message, users: &Users, state: &Glob
 
     println!("Received message from {}: {:?}", user_id, video_state);
 
-    *state.write().await = Some(video_state.clone());
+    match video_state.message_type.as_str() {
+        "get_current_state" => {
+            if let Some(current_state) = state.read().await.clone() {
+                if let Some(tx) = users.read().await.get(&user_id) {
+                    let _ = tx.send(Ok(Message::text(serde_json::to_string(&current_state).unwrap())));
+                }
+            }
+            return;
+        }
+        "heartbeat" => {
+            // Respond to heartbeat
+            if let Some(tx) = users.read().await.get(&user_id) {
+                let _ = tx.send(Ok(Message::text(serde_json::to_string(&VideoState {
+                    message_type: "heartbeat_ack".to_string(),
+                    time: None,
+                    playing: None,
+                    url: None,
+                }).unwrap())));
+            }
+            return;
+        }
+        _ => {
+            // Update global state for other message types
+            *state.write().await = Some(video_state.clone());
+        }
+    }
 
     let new_msg = serde_json::to_string(&video_state).unwrap();
 
@@ -171,18 +197,20 @@ async fn user_message(user_id: String, msg: Message, users: &Users, state: &Glob
         if *uid != user_id {
             if let Err(_disconnected) = tx.send(Ok(Message::text(new_msg.clone()))) {
                 // The tx is disconnected, our `user_disconnected` code
-                // should be happening in another task, nothing more to
-                // do here.
+                // should be handling this in another task
             }
         }
     }
 }
 
-async fn user_disconnected(user_id: String, users: &Users) {
-    let mut users = users.write().await;
-    if let Some(tx) = users.remove(&user_id) {
-        drop(tx); // Ensure the channel is closed
+async fn user_disconnected(user_id: String, users: &Users, state: &GlobalVideoState) {
+    users.write().await.remove(&user_id);
+    
+    // Only clear the global state if there are no more connected users
+    if users.read().await.is_empty() {
+        *state.write().await = None;
     }
+    
     println!("User disconnected: {}", user_id);
 }
 
