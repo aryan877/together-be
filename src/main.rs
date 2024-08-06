@@ -29,6 +29,7 @@ struct VideoState {
     time: Option<f64>,
     playing: Option<bool>,
     url: Option<String>,
+    caption_url: Option<String>,
 }
 
 // Constants for our application
@@ -181,13 +182,18 @@ async fn user_message(user_id: String, msg: Message, users: &Users, state: &Glob
                     time: None,
                     playing: None,
                     url: None,
+                    caption_url: None,
                 }).unwrap())));
             }
             return;
         }
-        _ => {
-            // Update global state for other message types
+        "new_video" | "video_state" | "new_caption" => {
+            // Update global state for these message types
             *state.write().await = Some(video_state.clone());
+        }
+        _ => {
+            eprintln!("Unknown message type: {}", video_state.message_type);
+            return;
         }
     }
 
