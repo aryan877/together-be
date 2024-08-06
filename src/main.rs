@@ -75,14 +75,20 @@ async fn main() {
     // Define the WebSocket route
     let ws_route = warp::path("ws")
         .and(warp::ws())
-        .and(users_filter)
-        .and(global_video_state_filter)
+        .and(users_filter.clone())
+        .and(global_video_state_filter.clone())
         .map(|ws: warp::ws::Ws, users, state| {
             ws.on_upgrade(move |socket| user_connected(socket, users, state))
         });
 
+    // Define the route for disconnecting all users
+    let disconnect_all = warp::post()
+        .and(warp::path("disconnect-all"))
+        .and(users_filter.clone())
+        .and_then(handle_disconnect_all);
+
     // Combine routes and apply CORS
-    let routes = connect.or(ws_route).with(cors);
+    let routes = connect.or(ws_route).or(disconnect_all).with(cors);
 
     // Start the cleanup task
     tokio::spawn(async move {
@@ -218,6 +224,15 @@ async fn user_disconnected(user_id: String, users: &Users, state: &GlobalVideoSt
     }
     
     println!("User disconnected: {}", user_id);
+}
+
+async fn handle_disconnect_all(users: Users) -> Result<impl Reply, Infallible> {
+    let mut users = users.write().await;
+    for (uid, tx) in users.iter() {
+        let _ = tx.send(Ok(Message::text("Server: Disconnecting all users".to_string())));
+    }
+    users.clear();
+    Ok(warp::reply::with_status("All users disconnected", warp::http::StatusCode::OK))
 }
 
 async fn cleanup_disconnected_users(users: &Users) {
